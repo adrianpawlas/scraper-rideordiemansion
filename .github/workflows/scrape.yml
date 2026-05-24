@@ -1,0 +1,42 @@
+name: Scrape Ride or Die Mansion
+
+on:
+  schedule:
+    - cron: '0 13 * * 2'
+    - cron: '0 13 * * 5'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-huggingface-${{ hashFiles('requirements.txt', 'scraper.py') }}
+          restore-keys: |
+            ${{ runner.os }}-huggingface-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgomp1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scraper.py
