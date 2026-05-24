@@ -2,6 +2,7 @@
 """
 Ride or Die Mansion Scraper
 Scrapes all products, generates SigLIP embeddings (768-dim), imports to Supabase.
+Smart upsert, batch inserts, stale removal, skip-unchanged logic.
 """
 
 import hashlib
@@ -13,7 +14,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from pathlib import Path
+from urllib.parse import urljoin, unquote
 
 import cloudscraper
 import numpy as np
@@ -45,6 +47,11 @@ CONCURRENCY = 3
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RATE_LIMIT_DELAY = 0.3
+BATCH_SIZE = 50
+EMBEDDING_STAGGER_S = 0.5
+STALE_FILE = Path("scrape_state.json")
+FAILED_LOG = Path("failed_products.log")
+STALE_RUNS_THRESHOLD = 2
 
 # =============================================================================
 # MODEL
@@ -86,12 +93,12 @@ def normalize_url(url: str) -> str:
     if not url:
         return ""
     if url.startswith("//"):
-        return "https:" + url
-    if url.startswith("/"):
-        return urljoin(BASE_URL, url)
-    if url.startswith("http://"):
-        return "https://" + url[7:]
-    return url
+        url = "https:" + url
+    elif url.startswith("/"):
+        url = urljoin(BASE_URL, url)
+    elif url.startswith("http://"):
+        url = "https://" + url[7:]
+    return unquote(url)
 
 
 def extract_shopify_currency(html: str) -> dict:
@@ -334,7 +341,7 @@ def parse_product_page(html: str, effective_locale: str = LOCALE) -> dict | None
     main_image = images[0] if images else ""
     additional_images = images[1:] if len(images) > 1 else []
 
-    product_url = f"{BASE_URL}/{effective_locale}/products/{handle}"
+    product_url = unquote(f"{BASE_URL}/{effective_locale}/products/{handle}")
 
     sizes = extract_sizes(variants)
     category = parse_category(product_type) if product_type else ""
@@ -426,7 +433,6 @@ def scrape_collection_pages(scraper) -> list[dict]:
             break
 
         if page == 1:
-            # Detect actual locale from page metadata
             m = re.search(r'ShopifyAnalytics\.meta\.currency\s*=\s*["\'](\w+)["\']', html)
             if m:
                 curr = m.group(1)
@@ -475,17 +481,106 @@ def scrape_collection_pages(scraper) -> list[dict]:
 
 
 # =============================================================================
+# COMPARISON
+# =============================================================================
+
+def product_fields_changed(scraped: dict, existing: dict) -> bool:
+    compare_fields = [
+        "price", "sale", "title", "description", "category",
+        "size", "image_url", "additional_images", "tags",
+    ]
+    for field in compare_fields:
+        s_val = scraped.get(field)
+        e_val = existing.get(field)
+        if s_val != e_val:
+            return True
+    return False
+
+
+def image_url_changed(scraped: dict, existing: dict) -> bool:
+    return scraped.get("image_url") != existing.get("image_url")
+
+
+# =============================================================================
+# STALE STATE
+# =============================================================================
+
+def load_stale_state() -> set[str]:
+    if STALE_FILE.exists():
+        try:
+            data = json.loads(STALE_FILE.read_text())
+            return set(data.get("unconfirmed_urls", []))
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return set()
+
+
+def save_stale_state(unconfirmed_urls: set[str]):
+    STALE_FILE.write_text(json.dumps({"unconfirmed_urls": list(unconfirmed_urls)}, indent=2))
+
+
+# =============================================================================
+# BATCH UPSERT
+# =============================================================================
+
+def batch_upsert(supabase_client: Client, records: list[dict]) -> list[dict]:
+    failed = []
+    for i in range(0, len(records), BATCH_SIZE):
+        batch = records[i:i + BATCH_SIZE]
+        ok = False
+        for attempt in range(MAX_RETRIES):
+            try:
+                supabase_client.table("products").upsert(batch, on_conflict="id").execute()
+                ok = True
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = (attempt + 1) * 2
+                    print(f"  [Batch Retry {attempt + 1}] batch {i // BATCH_SIZE + 1} failed: {e}, retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"  [Batch Error] batch {i // BATCH_SIZE + 1} failed after {MAX_RETRIES} attempts: {e}")
+                    for record in batch:
+                        failed.append(record["product_url"])
+        if ok:
+            print(f"  [Batch] Upserted {len(batch)} products (batch {i // BATCH_SIZE + 1}/{(len(records) - 1) // BATCH_SIZE + 1})")
+    return failed
+
+
+def log_failed_products(urls: list[str]):
+    if not urls:
+        return
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with FAILED_LOG.open("a") as f:
+        f.write(f"\n--- {timestamp} ---\n")
+        for url in urls:
+            f.write(f"{url}\n")
+    print(f"  Logged {len(urls)} failed products to {FAILED_LOG}")
+
+
+# =============================================================================
 # PRODUCT PROCESSING
 # =============================================================================
+
+_last_embed_time = 0
+
+def _stagger():
+    global _last_embed_time
+    now = time.time()
+    elapsed = now - _last_embed_time
+    if elapsed < EMBEDDING_STAGGER_S:
+        time.sleep(EMBEDDING_STAGGER_S - elapsed)
+    _last_embed_time = time.time()
+
 
 def process_single_product(
     product_info: dict,
     embedder: SigLipEmbedder,
-    supabase_client: Client,
+    existing_by_url: dict[str, dict],
     rates: dict[str, float],
 ) -> dict:
     product_url = product_info["url"]
-    result = {"url": product_url, "status": "pending", "error": None, "title": ""}
+    result = {"url": product_url, "status": "pending", "error": None, "title": "", "record": None}
     scraper = create_scraper()
 
     try:
@@ -506,14 +601,7 @@ def process_single_product(
             result["error"] = "Could not parse product"
             return result
 
-        image = fetch_image(scraper, parsed["image_url"])
-        if image:
-            image_emb = embedder.embed_image(image)
-        else:
-            print(f"  [Warning] No image for {parsed['title']}, using zero embedding")
-            image_emb = [0.0] * EMBEDDING_DIM
-
-        info_emb = embedder.embed_text(parsed["info_text"])
+        existing = existing_by_url.get(parsed["product_url"])
 
         price_str = format_all_prices(parsed["original_eur"], rates)
         sale_str = format_all_prices(parsed["sale_eur"], rates) if parsed["has_sale"] else None
@@ -530,8 +618,6 @@ def process_single_product(
             "description": parsed["description"],
             "category": parsed["category"],
             "gender": parsed["gender"],
-            "image_embedding": image_emb,
-            "info_embedding": info_emb,
             "size": parsed["size"],
             "second_hand": parsed["second_hand"],
             "country": None,
@@ -542,13 +628,50 @@ def process_single_product(
             "sale": sale_str,
             "additional_images": additional_images_str,
             "metadata": parsed["metadata"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": existing.get("created_at") if existing else datetime.now(timezone.utc).isoformat(),
         }
 
-        supabase_client.table("products").upsert(record, on_conflict="id").execute()
-        result["status"] = "success"
+        if existing and not product_fields_changed(record, existing):
+            result["status"] = "unchanged"
+            result["title"] = parsed["title"]
+            return result
+
+        needs_new_embeddings = not existing or image_url_changed(record, existing)
+
+        if needs_new_embeddings:
+            _stagger()
+            image = fetch_image(scraper, parsed["image_url"])
+            if image:
+                image_emb = embedder.embed_image(image)
+            else:
+                print(f"  [Warning] No image for {parsed['title']}, using zero embedding")
+                image_emb = [0.0] * EMBEDDING_DIM
+
+            _stagger()
+            info_emb = embedder.embed_text(parsed["info_text"])
+        elif existing:
+            image_emb = existing.get("image_embedding")
+            info_emb = existing.get("info_embedding")
+            if isinstance(image_emb, str):
+                try:
+                    image_emb = json.loads(image_emb)
+                except (json.JSONDecodeError, TypeError):
+                    image_emb = [0.0] * EMBEDDING_DIM
+            if isinstance(info_emb, str):
+                try:
+                    info_emb = json.loads(info_emb)
+                except (json.JSONDecodeError, TypeError):
+                    info_emb = [0.0] * EMBEDDING_DIM
+        else:
+            image_emb = [0.0] * EMBEDDING_DIM
+            info_emb = [0.0] * EMBEDDING_DIM
+
+        record["image_embedding"] = image_emb
+        record["info_embedding"] = info_emb
+
+        result["status"] = "new" if not existing else "updated"
         result["title"] = parsed["title"]
-        print(f"  [OK] {parsed['title']}")
+        result["record"] = record
 
     except Exception as e:
         result["status"] = "failed"
@@ -586,32 +709,103 @@ def main():
         print("No products found. Exiting.")
         return
 
-    print(f"\n[Step 3] Processing {len(products)} products (concurrency: {CONCURRENCY})...")
+    print("\n[Step 3] Fetching existing products from Supabase...")
+    existing_records = []
+    start = 0
+    while True:
+        resp = (
+            supabase_client.table("products")
+            .select("id, product_url, image_url, price, sale, title, description, category, size, additional_images, tags, image_embedding, info_embedding, created_at")
+            .eq("source", SOURCE)
+            .range(start, start + 999)
+            .execute()
+        )
+        batch = resp.data
+        if not batch:
+            break
+        existing_records.extend(batch)
+        start += 1000
+        if len(batch) < 1000:
+            break
+
+    existing_by_url: dict[str, dict] = {}
+    for r in existing_records:
+        existing_by_url[r["product_url"]] = r
+    print(f"  Found {len(existing_by_url)} existing products for this source")
+
+    seen_product_urls = set(p["url"] for p in products)
+
+    print(f"\n[Step 4] Processing {len(products)} products (concurrency: {CONCURRENCY})...")
     results = []
 
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
         futures = {
             executor.submit(
-                process_single_product, p, embedder, supabase_client, rates
+                process_single_product, p, embedder, existing_by_url, rates
             ): p["url"]
             for p in products
         }
         for future in as_completed(futures):
-            results.append(future.result())
+            res = future.result()
+            results.append(res)
+            if res["status"] == "unchanged":
+                pass
+            elif res["status"] == "new":
+                print(f"  [+] {res['title']}")
+            elif res["status"] == "updated":
+                print(f"  [~] {res['title']}")
+            elif res["status"] == "failed":
+                print(f"  [x] {res['title'] or res['url']}: {res['error']}")
 
-    success = sum(1 for r in results if r["status"] == "success")
-    failed = sum(1 for r in results if r["status"] == "failed")
+    records_to_upsert = [r["record"] for r in results if r["record"] is not None and r["status"] in ("new", "updated")]
+    count_new = sum(1 for r in results if r["status"] == "new")
+    count_updated = sum(1 for r in results if r["status"] == "updated")
+    count_unchanged = sum(1 for r in results if r["status"] == "unchanged")
+    count_failed = sum(1 for r in results if r["status"] == "failed")
 
-    print("\n" + "=" * 60)
-    print(f"Scraping complete!")
-    print(f"  Total: {len(results)}")
-    print(f"  Success: {success}")
-    print(f"  Failed: {failed}")
-    if failed:
-        print("\nFailed URLs:")
-        for r in results:
-            if r["status"] == "failed":
-                print(f"  - {r['url']}: {r['error']}")
+    if records_to_upsert:
+        print(f"\n[Step 5] Batch upserting {len(records_to_upsert)} products...")
+        failed_urls = batch_upsert(supabase_client, records_to_upsert)
+        if failed_urls:
+            log_failed_products(failed_urls)
+    else:
+        print("\n[Step 5] No products to upsert.")
+
+    print("\n[Step 6] Removing stale products...")
+    unconfirmed = load_stale_state()
+    stale_to_delete = []
+    stale_now_unconfirmed = set()
+    for r in existing_records:
+        url = r["product_url"]
+        if url not in seen_product_urls:
+            if url in unconfirmed:
+                stale_to_delete.append(url)
+            else:
+                stale_now_unconfirmed.add(url)
+    save_stale_state(stale_now_unconfirmed)
+
+    deleted_count = 0
+    if stale_to_delete:
+        for i in range(0, len(stale_to_delete), 50):
+            batch = stale_to_delete[i:i + 50]
+            try:
+                supabase_client.table("products").delete().in_("product_url", batch).eq("source", SOURCE).execute()
+                deleted_count += len(batch)
+            except Exception as e:
+                print(f"  [Stale Error] batch {i // 50 + 1}: {e}")
+    print(f"  Deleted {deleted_count} stale products")
+
+    print()
+    print("=" * 60)
+    print("Scraping complete!")
+    print(f"  Total processed: {len(results)}")
+    print(f"  [+] New:          {count_new}")
+    print(f"  [~] Updated:      {count_updated}")
+    print(f"  [-] Unchanged:    {count_unchanged}")
+    print(f"  [x] Failed:       {count_failed}")
+    print(f"  [D] Stale deleted: {deleted_count}")
+    if count_failed:
+        print(f"\nFailed products logged in: {FAILED_LOG}")
     print("=" * 60)
 
 

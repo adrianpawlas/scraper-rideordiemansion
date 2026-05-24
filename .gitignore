@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+scrape_state.json
+failed_products.log
