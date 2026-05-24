@@ -203,17 +203,24 @@ def format_all_prices(price_eur: float, rates: dict[str, float]) -> str:
 # =============================================================================
 
 def create_scraper() -> cloudscraper.CloudScraper:
-    return cloudscraper.create_scraper()
+    return cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "darwin", "mobile": False},
+        delay=15,
+    )
 
 
 def fetch(scraper, url: str, retries: int = MAX_RETRIES) -> str | None:
     for attempt in range(retries):
         try:
-            resp = scraper.get(url, timeout=REQUEST_TIMEOUT)
+            resp = scraper.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            status = resp.status_code
+            if status == 403:
+                print(f"  [Blocked] {url} — Cloudflare blocked (403), skipping retries")
+                return None
             resp.raise_for_status()
             return resp.text
         except Exception as e:
-            if attempt < retries - 1:
+            if attempt < retries - 1 and "403" not in str(e):
                 wait = (attempt + 1) * 2
                 print(f"  [Retry] {url} failed ({type(e).__name__}), retrying in {wait}s...")
                 time.sleep(wait)
@@ -425,10 +432,18 @@ def scrape_collection_pages(scraper) -> list[dict]:
     effective_locale = LOCALE
 
     while True:
-        url = f"{BASE_URL}/{effective_locale}/collections/all?page={page}"
-        print(f"[Collection] Page {page}...")
-
-        html = fetch(scraper, url)
+        max_retries = 2
+        html = None
+        for attempt in range(max_retries):
+            url = f"{BASE_URL}/{effective_locale}/collections/all?page={page}"
+            print(f"[Collection] Page {page}..." + (f" (retry {attempt + 1})" if attempt else ""))
+            html = fetch(scraper, url)
+            if html:
+                break
+            if attempt < max_retries - 1:
+                wait = 60
+                print(f"  Waiting {wait}s before retry (Cloudflare backoff)...")
+                time.sleep(wait)
         if not html:
             break
 
@@ -584,16 +599,25 @@ def process_single_product(
     scraper = create_scraper()
 
     try:
-        html = fetch(scraper, product_url)
-        if not html:
-            result["status"] = "failed"
-            result["error"] = "Could not fetch page"
-            return result
-
         prod_locale = LOCALE
         m = re.search(r'/([a-z]{2}-[a-z]{2})/products/', product_url)
         if m:
             prod_locale = m.group(1)
+
+        fallback_locales = ["en-cz", "en-us"]
+        try_locales = [prod_locale] + [l for l in fallback_locales if l != prod_locale]
+
+        html = None
+        for loc in try_locales:
+            test_url = product_url.replace(f"/{prod_locale}/", f"/{loc}/")
+            html = fetch(scraper, test_url)
+            if html:
+                break
+
+        if not html:
+            result["status"] = "failed"
+            result["error"] = "Could not fetch page in any locale"
+            return result
 
         parsed = parse_product_page(html, prod_locale)
         if not parsed:
